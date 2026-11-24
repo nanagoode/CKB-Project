@@ -1,0 +1,147 @@
+# =====================================================================
+# Nav1.6 interactome 2 x 2 factorial analysis (Sex x Housing)
+# Rat striatum, Nav1.6 IP-MS label-free intensities
+# Prespecified primary endpoint: CKB (Ckb, P07335) sex x housing interaction
+# Secondary: proteome-wide limma factorial analysis (889 proteins)
+# =====================================================================
+
+suppressPackageStartupMessages({
+  library(limma)
+  library(emmeans)
+})
+
+set.seed(123)
+
+## ---- Load data ------------------------------------------------------
+norm_long <- read.csv("/workspace/analysis/norm_log2.csv", check.names = FALSE)
+meta      <- read.csv("/workspace/analysis/metadata.csv", stringsAsFactors = FALSE)
+annot     <- read.csv("/workspace/analysis/protein_annotation.csv", stringsAsFactors = FALSE)
+
+# norm_long: one row per sample, columns = sample + protein accessions
+samples <- norm_long$sample
+X <- t(as.matrix(norm_long[, setdiff(names(norm_long), "sample")]))  # proteins x samples
+colnames(X) <- samples
+stopifnot(identical(colnames(X), meta$sample))
+
+meta$sex     <- factor(meta$sex,     levels = c("Female", "Male"))
+meta$housing <- factor(meta$housing, levels = c("EC", "IC"))
+
+cat("Matrix:", nrow(X), "proteins x", ncol(X), "samples\n")
+
+## ---- Design: ~ sex * housing ----------------------------------------
+design <- model.matrix(~ sex * housing, data = meta)
+colnames(design) <- c("(Intercept)", "sex_Male", "housing_IC", "sexMale_x_housingIC")
+print(design)
+
+fit <- lmFit(X, design)
+fit <- eBayes(fit, trend = TRUE, robust = TRUE)
+
+## ---- Coefficients ---------------------------------------------------
+# sex_Male: sex main effect (within EC)
+# housing_IC: housing main effect (within Female)
+# interaction: (MIC - MEC) - (FIC - FEC) direction is -interaction coefficient;
+# limma coefficient sexMale_x_housingIC = (MIC - MEC) - (FIC - FEC) * (-1)?
+# With baseline Female/EC: coefficient = (MIC - MEC) - (FIC - FEC) ... verify:
+# cell means: F_EC = int, F_IC = int + housing_IC, M_EC = int + sex_Male,
+# M_IC = int + sex_Male + housing_IC + inter
+# (M_EC - M_IC) - (F_EC - F_IC) = -(housing_IC + inter) + housing_IC = -inter
+# So prespecified contrast [(MEC-MIC)-(FEC-FIC)] = -interaction coefficient.
+results <- data.frame(
+  Accession = rownames(X),
+  Protein.Name = annot$Protein.Name[match(rownames(X), annot$Accession.Number)],
+  mean_MEC = rowMeans(X[, meta$group == "MEC"]),
+  mean_MIC = rowMeans(X[, meta$group == "MIC"]),
+  mean_FEC = rowMeans(X[, meta$group == "FEC"]),
+  mean_FIC = rowMeans(X[, meta$group == "FIC"]),
+  housing_effect_male   = rowMeans(X[, meta$group == "MEC"]) - rowMeans(X[, meta$group == "MIC"]),
+  housing_effect_female = rowMeans(X[, meta$group == "FEC"]) - rowMeans(X[, meta$group == "FIC"]),
+  sex_effect_EC  = rowMeans(X[, meta$group == "MEC"]) - rowMeans(X[, meta$group == "FEC"]),
+  sex_effect_IC  = rowMeans(X[, meta$group == "MIC"]) - rowMeans(X[, meta$group == "FIC"]),
+  check.names = FALSE
+)
+
+# Interaction estimate in prespecified direction: (MEC-MIC)-(FEC-FIC) = -limma inter coef
+results$interaction_estimate <- -(coef(fit)[, "sexMale_x_housingIC"])
+results$interaction_t        <- -(fit$t[, "sexMale_x_housingIC"])
+results$interaction_p        <- fit$p.value[, "sexMale_x_housingIC"]
+df_post  <- fit$df.residual + fit$df.prior
+se_inter <- fit$stdev.unscaled[, "sexMale_x_housingIC"] * sqrt(fit$s2.post)
+tcrit_v  <- qt(0.975, df = df_post)
+results$interaction_CI_lo <- -(fit$coefficients[, "sexMale_x_housingIC"] + tcrit_v * se_inter)
+results$interaction_CI_hi <- -(fit$coefficients[, "sexMale_x_housingIC"] - tcrit_v * se_inter)
+
+results$sex_p       <- fit$p.value[, "sex_Male"]
+results$sex_log2FC  <- coef(fit)[, "sex_Male"]
+results$housing_p       <- fit$p.value[, "housing_IC"]
+results$housing_log2FC  <- coef(fit)[, "housing_IC"]
+results$df_interaction  <- fit$df.residual + fit$df.prior
+
+## ---- BH-FDR per prespecified family ---------------------------------
+results$sex_q         <- p.adjust(results$sex_p, method = "BH")
+results$housing_q     <- p.adjust(results$housing_p, method = "BH")
+results$interaction_q <- p.adjust(results$interaction_p, method = "BH")
+
+cat("Significant (q<0.05): sex =", sum(results$sex_q < 0.05),
+    "| housing =", sum(results$housing_q < 0.05),
+    "| interaction =", sum(results$interaction_q < 0.05), "\n")
+
+## ---- CKB row ---------------------------------------------------------
+ckb <- results[results$Accession == "P07335", ]
+cat("\n--- CKB (P07335) ---\n")
+print(t(ckb))
+
+## ---- Directional classification --------------------------------------
+results$direction <- with(results, ifelse(
+  housing_effect_male > 0 & housing_effect_female > 0, "concordant_up",
+  ifelse(housing_effect_male < 0 & housing_effect_female < 0, "concordant_down",
+         "opposite")))
+cat("\nDirection table:\n"); print(table(results$direction))
+cat("Opposite AND interaction q<0.05:",
+    sum(results$direction == "opposite" & results$interaction_q < 0.05), "\n")
+
+## ---- Planned contrasts via emmeans (CKB) -----------------------------
+ckb_vec <- X["P07335", ]
+ckb_df  <- data.frame(log2_ckb = ckb_vec, meta)
+ckb_fit <- lm(log2_ckb ~ sex * housing, data = ckb_df)
+emm <- emmeans(ckb_fit, ~ sex * housing)
+cat("\n--- CKB estimated marginal means ---\n"); print(emm)
+
+contrasts_list <- list(
+  Male_EC_vs_IC   = c("sex", "housing"),  # placeholder, replaced below
+  dummy           = NULL
+)
+# Explicit contrast specifications on EMMs
+ec <- emmeans(ckb_fit, ~ housing | sex)
+pl <- pairs(ec)               # EC vs IC within each sex
+sc <- emmeans(ckb_fit, ~ sex | housing)
+ps <- pairs(sc)               # Male vs Female within each housing
+cat("\n--- Within-sex housing contrasts ---\n"); print(pl)
+cat("\n--- Within-housing sex contrasts ---\n"); print(ps)
+
+# Interaction contrast via emmeans
+inter_emm <- contrast(emm, interaction = c("pairwise", "pairwise"))
+cat("\n--- Interaction contrast (emmeans) ---\n"); print(inter_emm)
+
+# Holm-adjusted planned contrasts (4 tests)
+pl_summary <- as.data.frame(pl)   # housing EC vs IC within sex
+ps_summary <- as.data.frame(ps)
+pl_summary$comparison <- paste0(pl_summary$sex, ": EC vs IC")
+ps_summary$comparison <- paste0(ps_summary$housing, ": Male vs Female")
+all_planned <- rbind(
+  data.frame(comparison = pl_summary$comparison, estimate = pl_summary$estimate,
+             SE = pl_summary$SE, df = pl_summary$df, t.ratio = pl_summary$t.ratio,
+             p_raw = pl_summary$p.value),
+  data.frame(comparison = ps_summary$comparison, estimate = ps_summary$estimate,
+             SE = ps_summary$SE, df = ps_summary$df, t.ratio = ps_summary$t.ratio,
+             p_raw = ps_summary$p.value)
+)
+all_planned$p_holm <- p.adjust(all_planned$p_raw, method = "holm")
+all_planned$fold_change <- 2^(all_planned$estimate)
+tcrit <- qt(0.975, df = all_planned$df)
+all_planned$CI_lo <- all_planned$estimate - tcrit * all_planned$SE
+all_planned$CI_hi <- all_planned$estimate + tcrit * all_planned$SE
+cat("\n--- Planned contrasts (Holm-adjusted) ---\n")
+print(all_planned, digits = 4)
+
+
+cat("\nDone.\n")
